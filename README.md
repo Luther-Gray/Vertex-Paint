@@ -9,5 +9,10 @@ Vertex Paint comes with two tools that should be able to handle any project you 
 
 2. The Vertex Paint Bucket: Like you'd expect, this tool will color all selected verticies according to your selected Color & Opacity settings in one click.
 
+# Design Goals
+- Vertex Painting (Precise and Imprecise)
+- Vertex Groups (Using the Paint Layer Functionality)
+- Better Falloff Control (Allow for Sharp and Soft Vertex Color transitions.)
+
 ## 🖥️🌐 Install
 Installation is the same as every other Blockbench Plugin. Simply grab it from the Plugin Store, or Load the Plugin from the Javascript (`vertex_paint`) file.
