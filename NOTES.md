@@ -481,3 +481,84 @@ face.invert();
      }
      ```
      the colors remain permanently linked to the geometric vertex regardless of swaps or reordering of `face.vertices`. This matches Blockbench's native UV architecture (`face.uv[vkey] = [u, v]`).
+
+---
+
+## 7. Phase 3 Recon: Occlusion, Raycasting, Camera Invalidation, & Stroke Undo
+
+### Source Reference
+- **Files**:
+  - [`js/modeling/weight_paint.ts`](https://github.com/JannisX11/blockbench/blob/master/js/modeling/weight_paint.ts) (Lines 37–69, 191–200, 249–253)
+  - [`js/texturing/painter.js`](https://github.com/JannisX11/blockbench/blob/master/js/texturing/painter.js) (Lines 1145–1175, 3791–3800)
+
+### Code Snippets
+```typescript
+// js/modeling/weight_paint.ts (lines 38-69) - Raycaster Occlusion & Camera Invalidation
+let screen_space_vertex_positions: null | Record<string, {x:number, y:number}> = null;
+const raycaster = new THREE.Raycaster();
+function updateScreenSpaceVertexPositions(mesh: Mesh) {
+    if (screen_space_vertex_positions) return screen_space_vertex_positions;
+
+    const depth_check = BarItems.weight_brush_xray.value == false;
+    let vec = new THREE.Vector3();
+    raycaster.ray.origin.setFromMatrixPosition(Preview.selected.camera.matrixWorld);
+
+    screen_space_vertex_positions = {};
+    for (let vkey in mesh.vertices) {
+        let pos = mesh.mesh.localToWorld(vec.fromArray(mesh.vertices[vkey]));
+        if (depth_check) {
+            raycaster.ray.direction.copy(pos).sub(raycaster.ray.origin);
+            const z_distance = raycaster.ray.direction.length();
+            raycaster.ray.direction.normalize();
+            let intersection = raycaster.intersectObject(mesh.mesh, false)[0];
+            if (intersection && intersection.distance < z_distance - 0.001) {
+                continue; // Occluded by geometry in front!
+            }
+        }
+        let screen_pos = Preview.selected.vectorToScreenPosition(pos.clone());
+        screen_space_vertex_positions[vkey] = screen_pos;
+    }
+    return screen_space_vertex_positions;
+}
+Blockbench.on('update_camera_position', () => {
+    screen_space_vertex_positions = null;
+})
+```
+
+```typescript
+// js/modeling/weight_paint.ts (lines 191-199) - Single Undo Step per Stroke
+const stop = (event: MouseEvent) => {
+    document.removeEventListener('pointermove', draw);
+    document.removeEventListener('pointerup', stop);
+
+    Undo.finishEdit('Paint vertex weights');
+}
+document.addEventListener('pointermove', draw);
+document.addEventListener('pointerup', stop);
+draw(data.event as MouseEvent, data);
+```
+
+```typescript
+// js/modeling/weight_paint.ts (lines 249-253) - X-Ray / Ignore Depth Toggle
+new Toggle('weight_brush_xray', {
+    icon: 'disabled_visible',
+    category: 'edit',
+    condition: () => Toolbox?.selected?.id == 'weight_brush',
+})
+```
+
+### Findings
+1. **Raycaster Occlusion**:
+   - `raycaster.ray.origin.setFromMatrixPosition(preview.camera.matrixWorld)`.
+   - `raycaster.ray.direction.copy(pos).sub(raycaster.ray.origin)`.
+   - `intersection.distance < z_distance - 0.001` (or `- 0.005`) determines if a surface in front blocks the vertex.
+2. **Culling Order**:
+   - In Blockbench's `weight_paint.ts`, raycasting every vertex upfront causes performance issues on large meshes.
+   - For vertex paint, we first cull by 2D screen distance (`distPx <= brushSizePx`). Only vertices inside the brush radius are tested against the raycaster, and results are cached per vertex key in `occlusionCache`.
+3. **Camera Invalidation**:
+   - `Blockbench.on('update_camera_position', () => { ... })` invalidates the screen space vertex cache and occlusion cache whenever the camera is orbited, panned, or zoomed.
+4. **Single Undo Step**:
+   - `Undo.initEdit` is called once on pointerdown, `draw` mutates vertex colors on pointermove, and `Undo.finishEdit` is called once on pointerup.
+5. **Continuous Stroke Interpolation**:
+   - Fast pointer movement is interpolated continuously using swept circle / distance-to-segment math from `lastPos` to `currentPos`, ensuring smooth uninterrupted strokes without skipping vertices.
+

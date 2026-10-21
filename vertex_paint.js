@@ -8,6 +8,15 @@
 
   let originalUpdateGeometry = null;
 
+  let screenPosCache = null;
+  let occlusionCache = null;
+  const _raycaster = new THREE.Raycaster();
+
+  function _invalidateCaches() {
+    screenPosCache = null;
+    occlusionCache = null;
+  }
+
   Plugin.register("vertex_paint", {
     title: "Vertex Paint",
     author: "Luther Gray",
@@ -59,6 +68,23 @@
         },
       });
       MenuBar.addAction(this.toggleVertexColors, "view");
+
+      // -------------------------------------------------------------------
+      // 3b. Toggle Ignore Depth (X-Ray / Paint Through Occluded Vertices)
+      // -------------------------------------------------------------------
+      this.toggleIgnoreDepth = new Toggle("toggle_vertex_paint_ignore_depth", {
+        name: "Ignore Depth (Vertex Paint)",
+        description: "Paint through occluded vertices ignoring depth/surfaces in front",
+        icon: "disabled_visible",
+        category: "tools",
+        condition: () => _isVertexPaintToolActive(),
+        default: false,
+        onChange: () => {
+          _invalidateCaches();
+        },
+      });
+      MenuBar.addAction(this.toggleIgnoreDepth, "tools");
+      MenuBar.addAction(this.toggleIgnoreDepth, "view");
 
       // -------------------------------------------------------------------
       // 4. Tool 1: Vertex Paint Tool (Paint Mode Only, Meshes Only)
@@ -187,10 +213,13 @@
       };
 
       onUndoRedoHandler = () => {
+        _invalidateCaches();
         _updateAllMeshesGeometry();
       };
       registerBBEvent("undo", onUndoRedoHandler);
       registerBBEvent("redo", onUndoRedoHandler);
+      registerBBEvent("update_camera_position", _invalidateCaches);
+      registerBBEvent("resize_window", _invalidateCaches);
 
       registerBBEvent("add_texture", (data) => {
         if (data && data.texture && data.texture.material) {
@@ -199,6 +228,7 @@
       });
 
       const recompileHandler = () => {
+        _invalidateCaches();
         if (typeof Project !== "undefined" && Project) {
           _updateAllMeshesGeometry();
         }
@@ -207,6 +237,7 @@
       registerBBEvent("select_project", recompileHandler);
 
       const projectCloseHandler = () => {
+        _invalidateCaches();
         _hideBrushOutline();
         _hideHoverMarker();
       };
@@ -224,6 +255,8 @@
       eventListeners = [];
       onUndoRedoHandler = null;
 
+      _invalidateCaches();
+
       document.removeEventListener("pointermove", _updateHoverState);
       _removeHoverMarker();
       _hideBrushOutline();
@@ -237,6 +270,7 @@
       }
 
       if (this.toggleVertexColors) this.toggleVertexColors.delete();
+      if (this.toggleIgnoreDepth) this.toggleIgnoreDepth.delete();
       if (this.vertexPaintTool) this.vertexPaintTool.delete();
       if (this.vertexBucketTool) this.vertexBucketTool.delete();
       if (this.vertexEraserTool) this.vertexEraserTool.delete();
@@ -542,6 +576,109 @@
     }
   }
 
+  // =======================================================================
+  // Phase 3: Occlusion, Raycasting, Screen Caching, and Stroke Math
+  // =======================================================================
+
+  function _isIgnoreDepthActive() {
+    if (pluginInstance && pluginInstance.toggleIgnoreDepth) {
+      return pluginInstance.toggleIgnoreDepth.value === true;
+    }
+    return false;
+  }
+
+  function _isVertexOccluded(mesh, vkey, worldPos, preview) {
+    if (_isIgnoreDepthActive()) return false;
+    if (!occlusionCache) occlusionCache = new Map();
+    const cacheKey = mesh.uuid + "_" + vkey;
+    if (occlusionCache.has(cacheKey)) {
+      return occlusionCache.get(cacheKey);
+    }
+
+    _raycaster.ray.origin.setFromMatrixPosition(preview.camera.matrixWorld);
+    _raycaster.ray.direction.copy(worldPos).sub(_raycaster.ray.origin);
+    const zDistance = _raycaster.ray.direction.length();
+    _raycaster.ray.direction.normalize();
+
+    const intersections = _raycaster.intersectObject(mesh.mesh, false);
+    let isOccluded = false;
+    if (intersections && intersections.length > 0) {
+      if (intersections[0].distance < zDistance - 0.005) {
+        isOccluded = true;
+      }
+    }
+
+    occlusionCache.set(cacheKey, isOccluded);
+    return isOccluded;
+  }
+
+  function _getMeshScreenVertices(mesh, preview) {
+    if (!screenPosCache) screenPosCache = new Map();
+    if (screenPosCache.has(mesh)) {
+      return screenPosCache.get(mesh);
+    }
+
+    const list = [];
+    if (!mesh.mesh || mesh.visibility === false || !mesh.vertices) {
+      screenPosCache.set(mesh, list);
+      return list;
+    }
+
+    const tempVec = new THREE.Vector3();
+    for (let vkey in mesh.vertices) {
+      const raw = mesh.vertices[vkey];
+      if (!raw) continue;
+      tempVec.fromArray(raw);
+      mesh.mesh.localToWorld(tempVec);
+      const worldPos = tempVec.clone();
+      const screenPos = preview.vectorToScreenPosition(worldPos.clone());
+      if (screenPos) {
+        list.push({
+          vkey,
+          sx: screenPos.x,
+          sy: screenPos.y,
+          worldPos,
+        });
+      }
+    }
+
+    screenPosCache.set(mesh, list);
+    return list;
+  }
+
+  function _getNormalizedBrushOpacity() {
+    if (typeof BarItems === "undefined" || !BarItems.slider_brush_opacity) {
+      return 1.0;
+    }
+    const maxOpacity =
+      BarItems.slider_brush_opacity.settings &&
+      typeof BarItems.slider_brush_opacity.settings.max === "number"
+        ? BarItems.slider_brush_opacity.settings.max
+        : typeof settings !== "undefined" &&
+          settings.opacity_range &&
+          settings.opacity_range.value === "255"
+        ? 255
+        : 100;
+    const currentVal = BarItems.slider_brush_opacity.get();
+    return Math.max(0, Math.min(1, currentVal / maxOpacity));
+  }
+
+  function _distToSegmentSq(px, py, ax, ay, bx, by) {
+    const l2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+    if (l2 === 0) {
+      const dx = px - ax;
+      const dy = py - ay;
+      return dx * dx + dy * dy;
+    }
+    let t = ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / l2;
+    t = Math.max(0, Math.min(1, t));
+    const projX = ax + t * (bx - ax);
+    const projY = ay + t * (by - ay);
+    const dx = px - projX;
+    const dy = py - projY;
+    return dx * dx + dy * dy;
+  }
+
   function _updateHoverState(event) {
     if (
       typeof Project === "undefined" ||
@@ -566,7 +703,7 @@
     if (brushOutlineEl && (currentToolId === "vertex_paint" || currentToolId === "vertex_eraser")) {
       const brushSizePx =
         typeof BarItems !== "undefined" && BarItems.slider_brush_size
-          ? BarItems.slider_brush_size.get()
+          ? Math.max(BarItems.slider_brush_size.get(), 1)
           : 10;
       brushOutlineEl.style.left = event.clientX + "px";
       brushOutlineEl.style.top = event.clientY + "px";
@@ -596,8 +733,10 @@
       (currentToolId === "vertex_paint" || currentToolId === "vertex_eraser") &&
       typeof BarItems !== "undefined" &&
       BarItems.slider_brush_size
-        ? BarItems.slider_brush_size.get()
+        ? Math.max(BarItems.slider_brush_size.get(), 1)
         : 12;
+
+    const brushSizePxSq = brushSizePx * brushSizePx;
 
     const targetElements = (
       Outliner.selected && Outliner.selected.length
@@ -605,28 +744,21 @@
         : Outliner.elements || []
     ).filter((el) => el instanceof Mesh);
 
-    const tempWorldPos = new THREE.Vector3();
-    const tempVec2 = new THREE.Vector2();
     const hoveredPositions = [];
 
     targetElements.forEach((part) => {
-      if (!part.mesh || part.visibility === false || !part.vertices) return;
-
-      for (let vkey in part.vertices) {
-        tempWorldPos.fromArray(part.vertices[vkey]);
-        part.mesh.localToWorld(tempWorldPos);
-
-        const screenPos = preview.vectorToScreenPosition(tempWorldPos.clone());
-        if (!screenPos) continue;
-
-        const distPx = tempVec2
-          .set(screenPos.x - clickPos[0], screenPos.y - clickPos[1])
-          .length();
-
-        if (distPx <= brushSizePx) {
-          hoveredPositions.push(tempWorldPos.x, tempWorldPos.y, tempWorldPos.z);
+      const screenVerts = _getMeshScreenVertices(part, preview);
+      screenVerts.forEach((v) => {
+        const dx = v.sx - clickPos[0];
+        const dy = v.sy - clickPos[1];
+        if (Math.abs(dx) > brushSizePx || Math.abs(dy) > brushSizePx) return;
+        const distSq = dx * dx + dy * dy;
+        if (distSq <= brushSizePxSq) {
+          if (!_isVertexOccluded(part, v.vkey, v.worldPos, preview)) {
+            hoveredPositions.push(v.worldPos.x, v.worldPos.y, v.worldPos.z);
+          }
         }
-      }
+      });
     });
 
     if (hoveredPositions.length > 0 && hoverMarker) {
@@ -715,15 +847,18 @@
 
     Undo.initEdit({ elements: targetElements });
 
+    const getPosFromEvent = (e) => {
+      const previewOffset = $(preview.canvas).offset() || { left: 0, top: 0 };
+      return [e.clientX - previewOffset.left, e.clientY - previewOffset.top];
+    };
+
+    let lastPos = data.event ? getPosFromEvent(data.event) : [0, 0];
+
     const draw = (event, clickData) => {
       const mouseEvent = event || (clickData ? clickData.event : null);
       if (!mouseEvent) return;
 
-      const previewOffset = $(preview.canvas).offset() || { left: 0, top: 0 };
-      const clickPos = [
-        mouseEvent.clientX - previewOffset.left,
-        mouseEvent.clientY - previewOffset.top,
-      ];
+      const currentPos = getPosFromEvent(mouseEvent);
 
       const useSecondaryColor =
         mouseEvent.altKey || (typeof Pressing !== "undefined" && Pressing.overrides.alt);
@@ -737,81 +872,85 @@
         typeof BarItems !== "undefined" && BarItems.slider_brush_size
           ? BarItems.slider_brush_size.get()
           : 25;
-      const brushSizePx = Math.max(rawBrushSize, 10);
+      const brushSizePx = Math.max(rawBrushSize, 1);
+      const brushSizePxSq = brushSizePx * brushSizePx;
+
       const softnessFactor =
         typeof BarItems !== "undefined" && BarItems.slider_brush_softness
           ? BarItems.slider_brush_softness.get() / 100
           : 0.5;
 
-      const maxOpacity =
-        typeof BarItems !== "undefined" &&
-        BarItems.slider_brush_opacity &&
-        BarItems.slider_brush_opacity.settings
-          ? BarItems.slider_brush_opacity.settings.max
-          : (typeof settings !== "undefined" &&
-             settings.opacity_range &&
-             settings.opacity_range.value === "255"
-              ? 255
-              : 100);
+      const opacityFactor = _getNormalizedBrushOpacity();
 
-      const opacityFactor =
-        typeof BarItems !== "undefined" && BarItems.slider_brush_opacity
-          ? BarItems.slider_brush_opacity.get() / maxOpacity
-          : 1.0;
-
-      const tempWorldPos = new THREE.Vector3();
-      const tempVec2 = new THREE.Vector2();
+      // Bounding box for the swept segment expanded by brushSizePx
+      const minX = Math.min(lastPos[0], currentPos[0]) - brushSizePx;
+      const maxX = Math.max(lastPos[0], currentPos[0]) + brushSizePx;
+      const minY = Math.min(lastPos[1], currentPos[1]) - brushSizePx;
+      const maxY = Math.max(lastPos[1], currentPos[1]) + brushSizePx;
 
       targetElements.forEach((part) => {
         if (!part.mesh || !part.vertices || !part.faces) return;
         let modified = false;
 
-        for (let vkey in part.vertices) {
-          tempWorldPos.fromArray(part.vertices[vkey]);
-          part.mesh.localToWorld(tempWorldPos);
+        const screenVerts = _getMeshScreenVertices(part, preview);
+        screenVerts.forEach((v) => {
+          // 1. Cull vertices by screen bounding box & radius first
+          if (v.sx < minX || v.sx > maxX || v.sy < minY || v.sy > maxY) {
+            return;
+          }
 
-          const screenPos = preview.vectorToScreenPosition(tempWorldPos.clone());
-          if (!screenPos) continue;
+          const distSq = _distToSegmentSq(
+            v.sx,
+            v.sy,
+            lastPos[0],
+            lastPos[1],
+            currentPos[0],
+            currentPos[1]
+          );
+          if (distSq > brushSizePxSq) {
+            return;
+          }
 
-          const distPx = tempVec2
-            .set(screenPos.x - clickPos[0], screenPos.y - clickPos[1])
-            .length();
+          // 2. Cached raycast occlusion check second (unless ignore depth is toggled)
+          if (_isVertexOccluded(part, v.vkey, v.worldPos, preview)) {
+            return;
+          }
 
-          if (distPx <= brushSizePx) {
-            let falloff = 1.0;
-            if (softnessFactor > 0) {
-              const innerRadius = brushSizePx * (1.0 - softnessFactor);
-              if (distPx > innerRadius) {
-                const t = (distPx - innerRadius) / (brushSizePx - innerRadius);
-                falloff = 1.0 - Math.min(Math.max(t, 0), 1);
-                falloff = falloff * falloff * (3 - 2 * falloff);
-              }
-            }
-
-            const alpha = falloff * opacityFactor;
-
-            // Apply per-face color to every face referencing this vertex key
-            for (let fkey in part.faces) {
-              const face = part.faces[fkey];
-              if (face.vertices && face.vertices.includes(vkey)) {
-                const currColor = _getFaceVertexColor(face, vkey);
-                const newColor = [
-                  currColor[0] + (targetRGB[0] - currColor[0]) * alpha,
-                  currColor[1] + (targetRGB[1] - currColor[1]) * alpha,
-                  currColor[2] + (targetRGB[2] - currColor[2]) * alpha,
-                ];
-                _setFaceVertexColor(face, vkey, newColor);
-                modified = true;
-              }
+          const distPx = Math.sqrt(distSq);
+          let falloff = 1.0;
+          if (softnessFactor > 0) {
+            const innerRadius = brushSizePx * (1.0 - softnessFactor);
+            if (distPx > innerRadius) {
+              const t = (distPx - innerRadius) / (brushSizePx - innerRadius);
+              falloff = 1.0 - Math.min(Math.max(t, 0), 1);
+              falloff = falloff * falloff * (3 - 2 * falloff);
             }
           }
-        }
+
+          const alpha = falloff * opacityFactor;
+
+          // Apply per-face color to every face referencing this vertex key
+          for (let fkey in part.faces) {
+            const face = part.faces[fkey];
+            if (face.vertices && face.vertices.includes(v.vkey)) {
+              const currColor = _getFaceVertexColor(face, v.vkey);
+              const newColor = [
+                currColor[0] + (targetRGB[0] - currColor[0]) * alpha,
+                currColor[1] + (targetRGB[1] - currColor[1]) * alpha,
+                currColor[2] + (targetRGB[2] - currColor[2]) * alpha,
+              ];
+              _setFaceVertexColor(face, v.vkey, newColor);
+              modified = true;
+            }
+          }
+        });
 
         if (modified) {
           _writeVertexColorsToGeometry(part);
         }
       });
 
+      lastPos = currentPos;
       _updateHoverState(mouseEvent);
     };
 
@@ -847,22 +986,7 @@
       ? data.event.altKey || (typeof Pressing !== "undefined" && Pressing.overrides.alt)
       : false;
     const targetRGB = _getActiveColorRGB(useSecondaryColor);
-
-    const maxOpacity =
-      typeof BarItems !== "undefined" &&
-      BarItems.slider_brush_opacity &&
-      BarItems.slider_brush_opacity.settings
-        ? BarItems.slider_brush_opacity.settings.max
-        : (typeof settings !== "undefined" &&
-           settings.opacity_range &&
-           settings.opacity_range.value === "255"
-            ? 255
-            : 100);
-
-    const opacityFactor =
-      typeof BarItems !== "undefined" && BarItems.slider_brush_opacity
-        ? BarItems.slider_brush_opacity.get() / maxOpacity
-        : 1.0;
+    const opacityFactor = _getNormalizedBrushOpacity();
 
     targetElements.forEach((part) => {
       if (!part.mesh || !part.faces || !part.vertices) return;
