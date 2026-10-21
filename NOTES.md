@@ -562,3 +562,71 @@ new Toggle('weight_brush_xray', {
 5. **Continuous Stroke Interpolation**:
    - Fast pointer movement is interpolated continuously using swept circle / distance-to-segment math from `lastPos` to `currentPos`, ensuring smooth uninterrupted strokes without skipping vertices.
 
+---
+
+## 8. Phase 4 Recon: glTF Exporter Hook, Color Swapping, & sRGB→Linear Conversion
+
+### Source Reference
+- **Files**:
+  - [`js/formats/standards/gltf.js`](https://github.com/JannisX11/blockbench/blob/master/js/formats/standards/gltf.js) (Lines 523–604)
+  - [`js/lib/GLTFExporter.js`](https://github.com/JannisX11/blockbench/blob/master/js/lib/GLTFExporter.js) (Lines 110–126, 1240–1285)
+
+### Code Snippets
+```javascript
+// js/formats/standards/gltf.js (lines 573-585)
+let result = await new Promise((resolve, reject) => {
+    exporter.parse(gl_scene, resolve, {
+        animations,
+        onlyVisible: false,
+        trs: true,
+        binary: options.encoding == 'binary',
+        truncateDrawRange: false,
+        forcePowerOfTwoTextures: options.embed_textures != false,
+        scale_factor: 1/options.scale,
+        embedImages: options.embed_textures != false,
+        exportFaceColors: false, // HARDCODED TO FALSE
+    });
+})
+```
+
+```javascript
+// js/lib/GLTFExporter.js (lines 1240-1283)
+var nameConversion = {
+    uv: 'TEXCOORD_0',
+    uv2: 'TEXCOORD_1',
+    color: 'COLOR_0',
+    skinWeight: 'WEIGHTS_0',
+    skinIndex: 'JOINTS_0'
+};
+...
+var attribute = geometry.attributes[ attributeName ];
+attributeName = nameConversion[ attributeName ] || attributeName.toUpperCase();
+
+if (!options.exportFaceColors && attributeName === 'COLOR_0' ) continue;
+
+var validVertexAttributes =
+        /^(POSITION|NORMAL|TANGENT|TEXCOORD_\d+|COLOR_\d+|JOINTS_\d+|WEIGHTS_\d+)$/;
+if ( ! validVertexAttributes.test( attributeName ) ) {
+    attributeName = '_' + attributeName;
+}
+```
+
+### Findings
+1. **`exportFaceColors` Requirement**:
+   - `GLTFExporter` checks `!options.exportFaceColors && attributeName === 'COLOR_0'`. If `exportFaceColors` is `false`, `COLOR_0` is discarded.
+   - Calling `originalParse` with `options.exportFaceColors = true` allows `COLOR_0` to be written to the glTF buffer.
+2. **Preventing `_VP_COLOR` Custom Attribute Leak**:
+   - `GLTFExporter` prefixes any non-standard attribute name with `_`. Therefore, `vp_color` would be exported as `_VP_COLOR` if not removed before `parse()`.
+   - Removing `vp_color` during export prevents custom attribute pollution.
+3. **Preventing Stale Weight Paint Leak**:
+   - Blockbench's `updateGeometry` sets a `color` attribute containing `PLAIN_VERTEX_COLOR` (`[0, 0.03, 0.08]`) when weight painting isn't active.
+   - Deleting the existing `color` attribute prevents these dark weight paint colors from leaking into exported glTF files.
+4. **Color Space (sRGB → Linear)**:
+   - glTF 2.0 specification requires `COLOR_0` vertex colors to be stored in linear space:
+     $$c_{\text{linear}} = \begin{cases} \frac{c_{\text{srgb}}}{12.92} & c_{\text{srgb}} \le 0.04045 \\ \left(\frac{c_{\text{srgb}} + 0.055}{1.055}\right)^{2.4} & c_{\text{srgb}} > 0.04045 \end{cases}$$
+5. **Synchronous Buffer Generation & Restoration**:
+   - `GLTFExporter.prototype.parse` processes all scene nodes and mesh geometry attributes synchronously during the initial call before any async image handling.
+   - Stashing original attributes and restoring them in a `finally` block immediately after calling `originalParse` guarantees the live Three.js scene and viewport buffers remain completely intact.
+6. **Armature Length Mismatch Check**:
+   - If an armature path produces a geometry whose `vp_color.count !== position.count`, it must be skipped with `console.warn` to prevent malformed accessors.
+

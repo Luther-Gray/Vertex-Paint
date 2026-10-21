@@ -12,6 +12,14 @@
   let occlusionCache = null;
   const _raycaster = new THREE.Raycaster();
 
+  const UV_DECL = /(?:centroid\s+)?varying\s+vec2\s+vUv\s*;/;
+  const UV_ASSIGN = /\bvUv\s*=\s*uv\s*;/;
+  const SAMPLE = /vec4\s+(\w+)\s*=\s*texture(?:2D)?\s*\(\s*map\s*,\s*vUv\s*\)\s*;/;
+
+  let originalGLTFCompile = null;
+  let originalGLTFParse = null;
+  let exportingVC = false;
+
   function _invalidateCaches() {
     screenPosCache = null;
     occlusionCache = null;
@@ -51,6 +59,7 @@
       // -------------------------------------------------------------------
       _hookUpdateGeometry();
       _patchAllMaterials();
+      _hookGLTFExport();
 
       _setupHoverMarker();
 
@@ -263,6 +272,7 @@
 
       _unhookUpdateGeometry();
       _unpatchAllMaterials();
+      _unhookGLTFExport();
 
       if (vertexColorsProperty) {
         vertexColorsProperty.delete();
@@ -290,10 +300,6 @@
     }
     return true;
   }
-
-  const UV_DECL = /(?:centroid\s+)?varying\s+vec2\s+vUv\s*;/;
-  const UV_ASSIGN = /\bvUv\s*=\s*uv\s*;/;
-  const SAMPLE = /vec4\s+(\w+)\s*=\s*texture(?:2D)?\s*\(\s*map\s*,\s*vUv\s*\)\s*;/;
 
   function _patchVertexShader(src) {
     if (src.includes("vVpColor")) return src;
@@ -1059,5 +1065,126 @@
     });
 
     Undo.finishEdit("Vertex Paint Bucket");
+  }
+
+  // =======================================================================
+  // Phase 4: glTF Exporter Pipeline Hook
+  // =======================================================================
+
+  function _sRGBToLinear(c) {
+    return c < 0.04045 ? c * (1.0 / 12.92) : Math.pow((c + 0.055) * (1.0 / 1.055), 2.4);
+  }
+
+  function _hookGLTFExport() {
+    if (typeof Codecs !== "undefined" && Codecs.gltf && !originalGLTFCompile) {
+      originalGLTFCompile = Codecs.gltf.compile;
+      Codecs.gltf.compile = async function (options) {
+        exportingVC = true;
+        try {
+          return await originalGLTFCompile.apply(this, arguments);
+        } finally {
+          exportingVC = false;
+        }
+      };
+    }
+
+    if (typeof THREE !== "undefined" && THREE.GLTFExporter && !originalGLTFParse) {
+      originalGLTFParse = THREE.GLTFExporter.prototype.parse;
+      THREE.GLTFExporter.prototype.parse = function (input, onDone, options) {
+        if (!exportingVC) {
+          return originalGLTFParse.apply(this, arguments);
+        }
+
+        options = Object.assign({}, options, { exportFaceColors: true });
+
+        const restorations = [];
+        const scenes = Array.isArray(input) ? input : [input];
+
+        try {
+          scenes.forEach((root) => {
+            if (!root || typeof root.traverse !== "function") return;
+            root.traverse((obj) => {
+              if (!obj || !obj.isMesh || !obj.geometry) return;
+              const geo = obj.geometry;
+              if (!geo.attributes) return;
+
+              const originalColorAttr = geo.attributes.color || null;
+              const originalVpColorAttr = geo.attributes.vp_color || null;
+
+              // Stash and delete any existing color attribute (prevent stale weight paint leak)
+              delete geo.attributes.color;
+
+              if (originalVpColorAttr) {
+                const posCount = geo.attributes.position ? geo.attributes.position.count : 0;
+                if (originalVpColorAttr.count !== posCount) {
+                  console.warn(
+                    `Vertex Paint: vp_color count (${originalVpColorAttr.count}) does not match position count (${posCount}), skipping`,
+                    obj
+                  );
+                  // Remove vp_color so it is not exported as custom _VP_COLOR
+                  delete geo.attributes.vp_color;
+                  restorations.push({ geo, originalColorAttr, originalVpColorAttr, swappedColor: false });
+                  return;
+                }
+
+                // Check if the geometry has non-white vp_color
+                const vpArray = originalVpColorAttr.array;
+                let hasNonWhite = false;
+                for (let i = 0; i < vpArray.length; i++) {
+                  if (Math.abs(vpArray[i] - 1.0) > 0.001) {
+                    hasNonWhite = true;
+                    break;
+                  }
+                }
+
+                // Remove vp_color so it is not exported as custom _VP_COLOR
+                delete geo.attributes.vp_color;
+
+                if (hasNonWhite) {
+                  const linearArray = new Float32Array(vpArray.length);
+                  for (let i = 0; i < vpArray.length; i++) {
+                    linearArray[i] = _sRGBToLinear(vpArray[i]);
+                  }
+                  const newColorAttr = new THREE.BufferAttribute(linearArray, 3);
+                  geo.setAttribute("color", newColorAttr);
+                  restorations.push({ geo, originalColorAttr, originalVpColorAttr, swappedColor: true });
+                } else {
+                  restorations.push({ geo, originalColorAttr, originalVpColorAttr, swappedColor: false });
+                }
+              } else if (originalColorAttr) {
+                restorations.push({ geo, originalColorAttr, originalVpColorAttr: null, swappedColor: false });
+              }
+            });
+          });
+
+          return originalGLTFParse.call(this, input, onDone, options);
+        } finally {
+          // Restore everything immediately after the synchronous parse call
+          restorations.forEach(({ geo, originalColorAttr, originalVpColorAttr, swappedColor }) => {
+            if (swappedColor) {
+              delete geo.attributes.color;
+            }
+            if (originalColorAttr) {
+              geo.setAttribute("color", originalColorAttr);
+            }
+            if (originalVpColorAttr) {
+              geo.setAttribute("vp_color", originalVpColorAttr);
+            }
+          });
+        }
+      };
+    }
+  }
+
+  function _unhookGLTFExport() {
+    if (originalGLTFCompile && typeof Codecs !== "undefined" && Codecs.gltf) {
+      Codecs.gltf.compile = originalGLTFCompile;
+      originalGLTFCompile = null;
+    }
+    if (originalGLTFParse && typeof THREE !== "undefined" && THREE.GLTFExporter) {
+      THREE.GLTFExporter.prototype.parse = originalGLTFParse;
+      originalGLTFParse = null;
+    }
+    exportingVC = false;
   }
 })();
