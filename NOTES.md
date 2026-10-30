@@ -630,3 +630,27 @@ if ( ! validVertexAttributes.test( attributeName ) ) {
 6. **Armature Length Mismatch Check**:
    - If an armature path produces a geometry whose `vp_color.count !== position.count`, it must be skipped with `console.warn` to prevent malformed accessors.
 
+---
+
+## 9. Phase 5 Recon & Cleanup: UI Polish, Stroke Capping, Buildup, and Known Limits
+
+### Issues & Solutions
+1. **Brush Slider Visuals on Tool Switch**:
+   - When switching between tools, Blockbench's Vue toolbar can leave slider display numbers stale or displaying 1. Calling `BarItems.slider_brush_size.update()`, `slider_brush_softness.update()`, and `slider_brush_opacity.update()` inside `onSelect`, plus a deferred `setTimeout(..., 0)` tick, forces Vue to synchronize slider handles and numerical displays immediately.
+2. **Instant Cursor Outline Redraw**:
+   - Storing `lastPointerPos` via a lightweight window pointermove tracker allows `_showBrushOutline(lastPointerPos)` to instantly render and position the circular cursor outline at the current mouse position upon tool selection, without waiting for the user to move the mouse.
+3. **Suppressing Canvas Pixel Grid Box (`Canvas.brush_outline`)**:
+   - In Blockbench, texture painting tools draw a 2D texel box (`Canvas.brush_outline`). Even when `paintTool: false` is configured, prior tool selection or internal loops may leave it visible. Suppressing `Canvas.brush_outline.visible = false` and hiding its DOM style on select and during pointermove, and restoring it on unselect, completely removes the unwanted pixel grid box.
+4. **Scene Rebuild Resilience for Hover Marker**:
+   - If Blockbench rebuilds `Canvas.scene` (e.g. on project changes or camera resets), the hover highlight point cloud `hoverMarker` could be unparented. Checking `hoverMarker.parent !== Canvas.scene` and re-adding it ensures hover dots remain active and visible.
+5. **Per-Stroke Strength Capping & Buildup Spacing**:
+   - Without per-stroke capping, rapid pointermove events over the same vertex continuously compound color changes, causing a 15% opacity brush to instantly reach 100% on a short scrub.
+   - **Default Mode (Cap)**: For the duration of a stroke, each face vertex records `{ orig: [r,g,b], s: 0 }`. The strength is capped at `st.s = Math.max(st.s, strokeAlpha)`, ensuring that even scrubbing 50 times over the same spot in a single stroke never exceeds the opacity factor.
+   - **Buildup Mode (Airbrush)**: When the Buildup toggle is active, dabs accumulate continuously, but are strictly spaced by `minSpacing = Math.max(3, brushSizePx * 0.25)` to prevent click-plus-jitter doubling.
+6. **Streamlined Erase Workflow (Ctrl Key)**:
+   - Eliminating the redundant separate eraser tool declutters the toolbar. Holding `Ctrl` (or `Pressing.overrides.ctrl`) dynamically flips the stroke to target neutral white (`[1, 1, 1]`), turns the cursor circle rose-red for visual clarity, and labels undo steps as "Vertex Erase".
+7. **Clean Unload & Known Limits**:
+   - `onunload()` cleanly detaches all window/document listeners, unhooks `updateGeometry`, restores original shaders, restores `Canvas.brush_outline`, and clears mesh attributes.
+   - **Known Limit**: Newly created faces from modeling operations (extrude, subdivide) initialize with default neutral white vertex colors until painted.
+
+

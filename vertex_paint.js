@@ -12,6 +12,10 @@
   let occlusionCache = null;
   const _raycaster = new THREE.Raycaster();
 
+  let lastPointerPos = null;
+  let savedCanvasBrushOutlineVisible = null;
+  let pointerTracker = null;
+
   const UV_DECL = /(?:centroid\s+)?varying\s+vec2\s+vUv\s*;/;
   const UV_ASSIGN = /\bvUv\s*=\s*uv\s*;/;
   const SAMPLE = /vec4\s+(\w+)\s*=\s*texture(?:2D)?\s*\(\s*map\s*,\s*vUv\s*\)\s*;/;
@@ -34,16 +38,25 @@
     about:
       "# 👁️ Vertex Paint\n" +
       "Vertex Paint brings native 3D vertex painting to Blockbench! It features three dedicated tools and full viewport controls:\n\n" +
-      "1. **Vertex Paint Tool**: Paint mesh vertices using standard brush size, softness falloff, and opacity controls.\n" +
+      "1. **Vertex Paint Tool**: Paint mesh vertices using standard brush size, softness falloff, and opacity controls (Ctrl key also acts as an erase shortcut).\n" +
       "2. **Vertex Paint Bucket**: Instantly fill selected vertices, faces, or mesh elements using your active palette color and opacity settings.\n" +
-      "3. **Vertex Paint Eraser**: Cleanly erase vertex colors back to neutral white with brush size and opacity falloff.\n\n" +
-      "Includes a **Toggle Vertex Colors (Eye Icon)** view setting in the View Menu to switch vertex color visibility on/off at any time.",
+      "3. **Vertex Paint Eraser**: Dedicated eraser tool to cleanly erase mesh vertex colors back to neutral white with brush size and opacity falloff.\n\n" +
+      "Includes view & tool options:\n" +
+      "- **Toggle Vertex Colors (Eye Icon)**: View Menu setting to switch vertex color visibility on/off at any time.\n" +
+      "- **Ignore Depth**: Paint through occluded surfaces.\n" +
+      "- **Buildup / Airbrush**: Accumulate paint continuously within a single stroke.",
     version: "1.5.0",
     min_version: "4.8.0",
     variant: "both",
 
     onload() {
       pluginInstance = this;
+
+      // Track last pointer position across the window so tools can position outline immediately
+      pointerTracker = (e) => {
+        lastPointerPos = { clientX: e.clientX, clientY: e.clientY };
+      };
+      window.addEventListener("pointermove", pointerTracker);
 
       // -------------------------------------------------------------------
       // 1. Data Model: Register Property on MeshFace
@@ -96,13 +109,26 @@
       MenuBar.addAction(this.toggleIgnoreDepth, "view");
 
       // -------------------------------------------------------------------
+      // 3c. Toggle Buildup / Airbrush (Accumulate Paint within a Single Stroke)
+      // -------------------------------------------------------------------
+      this.toggleBuildup = new Toggle("toggle_vertex_paint_buildup", {
+        name: "Buildup / Airbrush (Vertex Paint)",
+        description: "Accumulate paint continuously when moving over vertices within a single stroke",
+        icon: "air",
+        category: "tools",
+        condition: () => _isVertexPaintToolActive(),
+        default: false,
+      });
+      MenuBar.addAction(this.toggleBuildup, "tools");
+
+      // -------------------------------------------------------------------
       // 4. Tool 1: Vertex Paint Tool (Paint Mode Only, Meshes Only)
       // -------------------------------------------------------------------
       this.vertexPaintTool = new Tool("vertex_paint", {
         id: "vertex_paint",
         name: "Vertex Paint Tool",
         icon: "fa-circle-nodes",
-        description: "Paint mesh vertices with brush size, falloff, and opacity.",
+        description: "Paint mesh vertices with brush size, falloff, and opacity. Hold Ctrl to erase.",
         category: "tools",
         toolbar: "brush",
         paintTool: false, // Prevents 2D texture pixel grid square box
@@ -119,18 +145,36 @@
         },
 
         onSelect() {
-          _showBrushOutline();
+          _setupHoverMarker();
+          _suppressCanvasBrushOutline();
+          _showBrushOutline(lastPointerPos);
+
+          const refreshSliders = () => {
+            if (typeof BarItems !== "undefined") {
+              if (BarItems.slider_brush_size && typeof BarItems.slider_brush_size.update === "function") BarItems.slider_brush_size.update();
+              if (BarItems.slider_brush_softness && typeof BarItems.slider_brush_softness.update === "function") BarItems.slider_brush_softness.update();
+              if (BarItems.slider_brush_opacity && typeof BarItems.slider_brush_opacity.update === "function") BarItems.slider_brush_opacity.update();
+            }
+          };
+          refreshSliders();
+          setTimeout(refreshSliders, 0);
+
           document.addEventListener("pointermove", _updateHoverState);
+          document.addEventListener("keydown", _onKeyDown);
+          document.addEventListener("keyup", _onKeyUp);
         },
 
         onUnselect: () => {
           _hideHoverMarker();
           _hideBrushOutline();
+          _restoreCanvasBrushOutline();
           document.removeEventListener("pointermove", _updateHoverState);
+          document.removeEventListener("keydown", _onKeyDown);
+          document.removeEventListener("keyup", _onKeyUp);
         },
 
         onCanvasClick: (data) => {
-          _handleBrushStroke(data, false);
+          _handleBrushStroke(data);
         },
       });
 
@@ -156,11 +200,23 @@
         },
 
         onSelect() {
+          _setupHoverMarker();
+          _suppressCanvasBrushOutline();
+
+          const refreshSliders = () => {
+            if (typeof BarItems !== "undefined") {
+              if (BarItems.slider_brush_opacity && typeof BarItems.slider_brush_opacity.update === "function") BarItems.slider_brush_opacity.update();
+            }
+          };
+          refreshSliders();
+          setTimeout(refreshSliders, 0);
+
           document.addEventListener("pointermove", _updateHoverState);
         },
 
         onUnselect: () => {
           _hideHoverMarker();
+          _restoreCanvasBrushOutline();
           document.removeEventListener("pointermove", _updateHoverState);
         },
 
@@ -193,18 +249,32 @@
         },
 
         onSelect() {
-          _showBrushOutline();
+          _setupHoverMarker();
+          _suppressCanvasBrushOutline();
+          _showBrushOutline(lastPointerPos);
+
+          const refreshSliders = () => {
+            if (typeof BarItems !== "undefined") {
+              if (BarItems.slider_brush_size && typeof BarItems.slider_brush_size.update === "function") BarItems.slider_brush_size.update();
+              if (BarItems.slider_brush_softness && typeof BarItems.slider_brush_softness.update === "function") BarItems.slider_brush_softness.update();
+              if (BarItems.slider_brush_opacity && typeof BarItems.slider_brush_opacity.update === "function") BarItems.slider_brush_opacity.update();
+            }
+          };
+          refreshSliders();
+          setTimeout(refreshSliders, 0);
+
           document.addEventListener("pointermove", _updateHoverState);
         },
 
         onUnselect: () => {
           _hideHoverMarker();
           _hideBrushOutline();
+          _restoreCanvasBrushOutline();
           document.removeEventListener("pointermove", _updateHoverState);
         },
 
         onCanvasClick: (data) => {
-          _handleBrushStroke(data, true); // Eraser mode = true
+          _handleBrushStroke(data, true);
         },
       });
 
@@ -266,9 +336,17 @@
 
       _invalidateCaches();
 
+      if (pointerTracker) {
+        window.removeEventListener("pointermove", pointerTracker);
+        pointerTracker = null;
+      }
       document.removeEventListener("pointermove", _updateHoverState);
+      document.removeEventListener("keydown", _onKeyDown);
+      document.removeEventListener("keyup", _onKeyUp);
+
       _removeHoverMarker();
       _hideBrushOutline();
+      _restoreCanvasBrushOutline();
 
       _unhookUpdateGeometry();
       _unpatchAllMaterials();
@@ -281,6 +359,7 @@
 
       if (this.toggleVertexColors) this.toggleVertexColors.delete();
       if (this.toggleIgnoreDepth) this.toggleIgnoreDepth.delete();
+      if (this.toggleBuildup) this.toggleBuildup.delete();
       if (this.vertexPaintTool) this.vertexPaintTool.delete();
       if (this.vertexBucketTool) this.vertexBucketTool.delete();
       if (this.vertexEraserTool) this.vertexEraserTool.delete();
@@ -521,7 +600,12 @@
   // =======================================================================
 
   function _setupHoverMarker() {
-    if (hoverMarker) return;
+    if (hoverMarker) {
+      if (typeof Canvas !== "undefined" && Canvas.scene && hoverMarker.parent !== Canvas.scene) {
+        Canvas.scene.add(hoverMarker);
+      }
+      return;
+    }
     const maxPoints = 600;
     const positions = new Float32Array(maxPoints * 3);
     const geo = new THREE.BufferGeometry();
@@ -560,7 +644,33 @@
     if (hoverMarker) hoverMarker.visible = false;
   }
 
-  function _showBrushOutline() {
+  function _suppressCanvasBrushOutline() {
+    if (typeof Canvas !== "undefined" && Canvas.brush_outline) {
+      if (savedCanvasBrushOutlineVisible === null && "visible" in Canvas.brush_outline) {
+        savedCanvasBrushOutlineVisible = Canvas.brush_outline.visible;
+      }
+      if ("visible" in Canvas.brush_outline) {
+        Canvas.brush_outline.visible = false;
+      }
+      if (Canvas.brush_outline.style) {
+        Canvas.brush_outline.style.display = "none";
+      }
+    }
+  }
+
+  function _restoreCanvasBrushOutline() {
+    if (typeof Canvas !== "undefined" && Canvas.brush_outline) {
+      if ("visible" in Canvas.brush_outline && savedCanvasBrushOutlineVisible !== null) {
+        Canvas.brush_outline.visible = savedCanvasBrushOutlineVisible;
+      }
+      if (Canvas.brush_outline.style && savedCanvasBrushOutlineVisible !== null) {
+        Canvas.brush_outline.style.display = savedCanvasBrushOutlineVisible ? "block" : "none";
+      }
+    }
+    savedCanvasBrushOutlineVisible = null;
+  }
+
+  function _showBrushOutline(pos) {
     if (!brushOutlineEl) {
       brushOutlineEl = document.createElement("div");
       brushOutlineEl.id = "vertex_brush_outline";
@@ -573,12 +683,44 @@
       brushOutlineEl.style.display = "none";
       document.body.appendChild(brushOutlineEl);
     }
-    brushOutlineEl.style.display = "block";
+
+    const brushSizePx =
+      typeof BarItems !== "undefined" && BarItems.slider_brush_size
+        ? Math.max(BarItems.slider_brush_size.get(), 1)
+        : 10;
+    brushOutlineEl.style.width = brushSizePx * 2 + "px";
+    brushOutlineEl.style.height = brushSizePx * 2 + "px";
+
+    const currentToolId = typeof Toolbox !== "undefined" && Toolbox.selected ? Toolbox.selected.id : "";
+    const isEraserTool = currentToolId === "vertex_eraser";
+    const isCtrl = typeof Pressing !== "undefined" && Pressing.overrides.ctrl;
+    brushOutlineEl.style.borderColor = isEraserTool || isCtrl ? "rgba(244, 63, 94, 0.85)" : "rgba(56, 189, 248, 0.85)";
+
+    if (pos && typeof pos.clientX === "number") {
+      brushOutlineEl.style.left = pos.clientX + "px";
+      brushOutlineEl.style.top = pos.clientY + "px";
+      brushOutlineEl.style.display = "block";
+    }
   }
 
   function _hideBrushOutline() {
     if (brushOutlineEl) {
       brushOutlineEl.style.display = "none";
+    }
+  }
+
+  function _onKeyDown(e) {
+    if (e.key === "Control" && brushOutlineEl && brushOutlineEl.style.display !== "none") {
+      brushOutlineEl.style.borderColor = "rgba(244, 63, 94, 0.85)"; // Rose red for erase
+    }
+  }
+
+  function _onKeyUp(e) {
+    if (e.key === "Control" && brushOutlineEl && brushOutlineEl.style.display !== "none") {
+      const currentToolId = typeof Toolbox !== "undefined" && Toolbox.selected ? Toolbox.selected.id : "";
+      if (currentToolId === "vertex_paint") {
+        brushOutlineEl.style.borderColor = "rgba(56, 189, 248, 0.85)"; // Cyan for paint
+      }
     }
   }
 
@@ -686,6 +828,10 @@
   }
 
   function _updateHoverState(event) {
+    if (event && typeof event.clientX === "number") {
+      lastPointerPos = { clientX: event.clientX, clientY: event.clientY };
+    }
+
     if (
       typeof Project === "undefined" ||
       !Project ||
@@ -696,6 +842,8 @@
       return;
     }
 
+    _suppressCanvasBrushOutline();
+
     const preview = Preview.selected;
     if (!preview) {
       _hideHoverMarker();
@@ -705,7 +853,7 @@
 
     const currentToolId = Toolbox.selected.id;
 
-    // Update 2D Cursor Brush Outline
+    // Update 2D Cursor Brush Outline (Paint or Eraser tool)
     if (brushOutlineEl && (currentToolId === "vertex_paint" || currentToolId === "vertex_eraser")) {
       const brushSizePx =
         typeof BarItems !== "undefined" && BarItems.slider_brush_size
@@ -717,17 +865,15 @@
       brushOutlineEl.style.height = brushSizePx * 2 + "px";
       brushOutlineEl.style.display = "block";
 
-      if (currentToolId === "vertex_eraser") {
-        brushOutlineEl.style.borderColor = "rgba(244, 63, 94, 0.85)"; // Rose red outline for eraser
-      } else {
-        brushOutlineEl.style.borderColor = "rgba(56, 189, 248, 0.85)"; // Cyan for paint
-      }
+      const isEraserTool = currentToolId === "vertex_eraser";
+      const isCtrl = event.ctrlKey || (typeof Pressing !== "undefined" && Pressing.overrides.ctrl);
+      brushOutlineEl.style.borderColor = isEraserTool || isCtrl ? "rgba(244, 63, 94, 0.85)" : "rgba(56, 189, 248, 0.85)";
     } else if (brushOutlineEl) {
       brushOutlineEl.style.display = "none";
     }
 
     // Update 3D Hover Marker Points (Meshes Only)
-    if (!hoverMarker) _setupHoverMarker();
+    _setupHoverMarker();
 
     const previewOffset = $(preview.canvas).offset() || { left: 0, top: 0 };
     const clickPos = [
@@ -797,7 +943,11 @@
     if (!face.vertex_colors || typeof face.vertex_colors !== "object") {
       face.vertex_colors = {};
     }
-    face.vertex_colors[vkey] = [rgb[0], rgb[1], rgb[2]];
+    face.vertex_colors[vkey] = [
+      Math.max(0, Math.min(1, rgb[0])),
+      Math.max(0, Math.min(1, rgb[1])),
+      Math.max(0, Math.min(1, rgb[2])),
+    ];
   }
 
   function _getActiveColorRGB(useSecondary = false) {
@@ -833,10 +983,17 @@
     );
   }
 
+  function _isBuildupActive() {
+    if (pluginInstance && pluginInstance.toggleBuildup) {
+      return pluginInstance.toggleBuildup.value === true;
+    }
+    return false;
+  }
+
   // =======================================================================
   // Tool 1 & Tool 3: Brush & Eraser Stroke Handling (Meshes Only)
   // =======================================================================
-  function _handleBrushStroke(data, isEraser = false) {
+  function _handleBrushStroke(data, isEraserTool = false) {
     const preview = Preview.selected;
     if (!preview) return;
 
@@ -859,6 +1016,12 @@
     };
 
     let lastPos = data.event ? getPosFromEvent(data.event) : [0, 0];
+    let lastDabPos = lastPos.slice();
+    let isFirstDab = true;
+    const isBuildup = _isBuildupActive();
+    const strokeState = new Map(); // part.uuid + "_" + fkey + "_" + vkey -> { orig: [r,g,b], s: 0 }
+
+    let isEraseStroke = false;
 
     const draw = (event, clickData) => {
       const mouseEvent = event || (clickData ? clickData.event : null);
@@ -866,20 +1029,37 @@
 
       const currentPos = getPosFromEvent(mouseEvent);
 
-      const useSecondaryColor =
-        mouseEvent.altKey || (typeof Pressing !== "undefined" && Pressing.overrides.alt);
-      const isCtrlEraser =
-        mouseEvent.ctrlKey || (typeof Pressing !== "undefined" && Pressing.overrides.ctrl);
-
-      // Eraser sets target color to neutral white [1, 1, 1]
-      const targetRGB = isEraser || isCtrlEraser ? [1.0, 1.0, 1.0] : _getActiveColorRGB(useSecondaryColor);
-
       const rawBrushSize =
         typeof BarItems !== "undefined" && BarItems.slider_brush_size
           ? BarItems.slider_brush_size.get()
           : 25;
       const brushSizePx = Math.max(rawBrushSize, 1);
       const brushSizePxSq = brushSizePx * brushSizePx;
+
+      // Spacing check for buildup / airbrush mode to prevent click-plus-jitter doubling
+      if (isBuildup && !isFirstDab) {
+        const dx = currentPos[0] - lastDabPos[0];
+        const dy = currentPos[1] - lastDabPos[1];
+        const minSpacing = Math.max(3, brushSizePx * 0.25);
+        if (dx * dx + dy * dy < minSpacing * minSpacing) {
+          lastPos = currentPos;
+          _updateHoverState(mouseEvent);
+          return;
+        }
+      }
+      lastDabPos = currentPos.slice();
+      isFirstDab = false;
+
+      const useSecondaryColor =
+        mouseEvent.altKey || (typeof Pressing !== "undefined" && Pressing.overrides.alt);
+      const isCtrlEraser =
+        mouseEvent.ctrlKey || (typeof Pressing !== "undefined" && Pressing.overrides.ctrl);
+
+      const isErasing = isEraserTool || isCtrlEraser;
+      if (isErasing) isEraseStroke = true;
+
+      // Eraser sets target color to neutral white [1, 1, 1]
+      const targetRGB = isErasing ? [1.0, 1.0, 1.0] : _getActiveColorRGB(useSecondaryColor);
 
       const softnessFactor =
         typeof BarItems !== "undefined" && BarItems.slider_brush_softness
@@ -933,19 +1113,38 @@
             }
           }
 
-          const alpha = falloff * opacityFactor;
+          const strokeAlpha = falloff * opacityFactor;
+          if (strokeAlpha <= 0) return;
 
           // Apply per-face color to every face referencing this vertex key
           for (let fkey in part.faces) {
             const face = part.faces[fkey];
             if (face.vertices && face.vertices.includes(v.vkey)) {
-              const currColor = _getFaceVertexColor(face, v.vkey);
-              const newColor = [
-                currColor[0] + (targetRGB[0] - currColor[0]) * alpha,
-                currColor[1] + (targetRGB[1] - currColor[1]) * alpha,
-                currColor[2] + (targetRGB[2] - currColor[2]) * alpha,
-              ];
-              _setFaceVertexColor(face, v.vkey, newColor);
+              if (isBuildup) {
+                // Buildup / Airbrush mode: dabs accumulate on the current color
+                const currColor = _getFaceVertexColor(face, v.vkey);
+                const newColor = [
+                  currColor[0] + (targetRGB[0] - currColor[0]) * strokeAlpha,
+                  currColor[1] + (targetRGB[1] - currColor[1]) * strokeAlpha,
+                  currColor[2] + (targetRGB[2] - currColor[2]) * strokeAlpha,
+                ];
+                _setFaceVertexColor(face, v.vkey, newColor);
+              } else {
+                // Standard capped stroke: remember orig color at stroke start and cap strength at strongest dab
+                const k = part.uuid + "_" + fkey + "_" + v.vkey;
+                let st = strokeState.get(k);
+                if (!st) {
+                  st = { orig: _getFaceVertexColor(face, v.vkey).slice(), s: 0 };
+                  strokeState.set(k, st);
+                }
+                st.s = Math.max(st.s, strokeAlpha);
+                const newColor = [
+                  st.orig[0] + (targetRGB[0] - st.orig[0]) * st.s,
+                  st.orig[1] + (targetRGB[1] - st.orig[1]) * st.s,
+                  st.orig[2] + (targetRGB[2] - st.orig[2]) * st.s,
+                ];
+                _setFaceVertexColor(face, v.vkey, newColor);
+              }
               modified = true;
             }
           }
@@ -963,7 +1162,7 @@
     const stop = () => {
       document.removeEventListener("pointermove", draw);
       document.removeEventListener("pointerup", stop);
-      Undo.finishEdit(isEraser ? "Vertex Paint Eraser" : "Vertex Paint Tool");
+      Undo.finishEdit(isEraserTool ? "Vertex Paint Eraser" : (isEraseStroke ? "Vertex Erase" : "Vertex Paint Tool"));
     };
 
     document.addEventListener("pointermove", draw);

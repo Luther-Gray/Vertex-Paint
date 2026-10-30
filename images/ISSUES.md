@@ -1,14 +1,35 @@
-Textures vanish while painting. You swap in a flat Lambert material. BBColor instead patches Blockbench’s textured shader so texture × vertex color. That’s the idea to port, but not the code: it assigns modparameters as a global only inside the if, so any non-matching ShaderMaterial gets stale or undefined params.
-Colors live in an unregistered part.vertexColors. They aren’t saved to .bbmodel, aren’t covered by undo, and are lost on duplicate. BBColor registers a Property on MeshFace.
-Reattachment fires on the wrong events. Blockbench rebuilds the geometry whenever a mesh changes, which discards your attribute. You re-apply on update_view and update_selection, which fire constantly. BBColor wraps Mesh.preview_controller.updateGeometry, which is the right place.
-The buffer mapping is off. It doesn’t skip faces with 2 or fewer vertices the way the geometry builder does, so colors misalign. Cubes can’t work at all because their buffers have 24 vertices, not 8. Since you don’t box model, scope it to meshes only.
-Standard naming is your advantage. Your plugin uses three.js’s standard color attribute, which three’s GLTFExporter writes as COLOR_0. BBColor’s custom vColor would be ignored, which is probably why it stops at FBX. Whether it flows through depends on how Blockbench’s glTF codec builds its scene, so that needs checking first.
-Smaller issues: painting goes through to back faces, fast drags skip vertices, and dividing opacity by 255 may be stale after the 100/255 setting. Colors also need a decision on color space, since hex is sRGB and glTF vertex colors are linear.
+Brush sensitivity (cleanup)
 
----
+The cause is that every pointermove re-applies the brush to the already-painted color, and the click itself draws once before the first move. The fix is to remember each vertex’s original color for the duration of the stroke and cap the strength at the strongest dab:
 
-This is a sketch to verify, not tested code. The sRGB→linear conversion is there because glTF vertex colors are linear and your hex values are sRGB.
+js
+const strokeState = new Map(); // per stroke
+// in the per-face apply:
+const k = fkey + "|" + v.vkey;
+let st = strokeState.get(k);
+if (!st) strokeState.set(k, st = { orig: _getFaceVertexColor(face, v.vkey).slice(), s: 0 });
+st.s = Math.max(st.s, alpha);
+_setFaceVertexColor(face, v.vkey, [0,1,2].map(i => st.orig[i] + (targetRGB[i] - st.orig[i]) * st.s));
 
-What’s still open
+A 15% brush then gives at most 15% per stroke. Add a “Buildup” toggle for the airbrush feel: when it’s on, skip the cap and only dab once the cursor has moved at least max(3, radius * 0.25) px from the last dab. That also kills the click-plus-jitter doubling.
 
-Phase 0 items (b), (d), (e), (f) need js/outliner/types/mesh.js, where updateGeometry and the weight-paint code live, plus wherever the textured ShaderMaterial is built.
+Pixel grid and settings reset
+
+I can’t see these from the code alone, so Gemini should check:
+
+Pixel grid: your earlier version hid Canvas.brush_outline, and this one doesn’t. Have Gemini search Blockbench for brush_outline and hide it on select, plus on each pointermove if Blockbench re-shows it.
+Outline looks like 1: the circle only gets its size inside pointermove, so after switching back it’s stale until the mouse moves. BBColor calls .update() on its sliders in onSelect, so do the same for slider_brush_size, softness and opacity. Store the last pointer position and redraw the outline immediately.
+Hover marker: re-add it to Canvas.scene on select in case the scene was rebuilt.
+
+The slider numbers
+
+The values are fine and the displays are stale. Your onSelect only shows the outline, and nothing refreshes the sliders. BBColor’s code calls .update() on its sliders in onSelect, which is the likely fix. Blockbench probably re-shows the sliders after onSelect runs, so the refresh may need to be deferred a tick.
+
+Cleanup list to paste to Gemini
+
+In onSelect for the paint tool, call BarItems.slider_brush_size.update(), then the same for slider_brush_softness and slider_brush_opacity. If the numbers still show 1, wrap the calls in setTimeout(..., 0). If that still fails, find how Blockbench’s native brush tool refreshes these sliders on switch and copy it.
+Store the last pointer position, and redraw the brush outline in onSelect using it, so it doesn’t wait for a mouse move.
+Hide the pixel grid square. Search Blockbench for Canvas.brush_outline and hide it on select, and again on pointermove if it gets re-shown. Restore it in onUnselect.
+Re-add the hover marker to Canvas.scene on select.
+Apply the per-stroke strength cap, with the buildup toggle and minimum-distance spacing I described.
+Remove the eraser tool and keep the Ctrl behavior.
